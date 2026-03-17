@@ -59,45 +59,116 @@ def inferir_dept(acao, orgao=""):
 
 def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
     """
-    Aceita dois formatos:
+    Parser unificado para os formatos que o Gem/IA produz:
 
-    FORMATO A — gerado pelo Gemini / IA externa:
-    ─────────────────────────────────────────────
-    ### BCA / Área / Departamento
-    **Pastas: Proc-0001, Proc-0002 e Proc-0003 (Título do grupo)**
-    Parágrafo de resumo gerado pela IA...
-    * Deliberação:
+    FORMATO A (markdown com **):
+        ### BCA / Área / Dept
+        **Pastas: Proc-X e Proc-Y (Título)**
+        Resumo em parágrafo...
 
-    FORMATO B — entrada manual simples:
-    ────────────────────────────────────
-    Pasta: Proc-0001
-    Ação: Reclamação Trabalhista
-    Partes: Empresa X x Fulano
-    Área: Trabalhista
-    Resumo: texto opcional
-    Andamentos:
-    [15/02/2026] Audiência realizada...
+    FORMATO B (texto plano, sem markdown):
+        BCA / Área Operacional / Direito Público
+        Pasta: Proc-0001569 (Tipo) Resumo inline na mesma linha.
 
-    Os dois formatos podem ser misturados no mesmo texto.
-    Processos são separados automaticamente — não precisa de "---".
+        Deliberação:
+        Grupo: Título (Pastas: Proc-X, Proc-Y) Resumo inline.
+
+        Deliberação:
+
+    Os dois formatos podem coexistir no mesmo texto.
     """
-    MAPA_HEADER_DEPT_LOCAL = {
-        "cível":      "Cível",  "civil":     "Cível",  "conflitos": "Cível",
-        "público":    "Público", "publico":   "Público",
-        "trabalhist": "Trabalhista",
-        "privado":    "Privado",
-        "compliance": "Compliance",
+    MAPA_HEADER_DEPT_LOC = {
+        "cível":       "Cível",   "civil":       "Cível",   "conflitos": "Cível",
+        "público":     "Público", "publico":     "Público",
+        "trabalhist":  "Trabalhista",
+        "privado":     "Privado", "societário":  "Privado", "imobiliário": "Privado",
+        "compliance":  "Compliance",
     }
+    MAPA_ACAO_DEPT_LOC = {
+        "reclamação trabalhista": "Trabalhista", "reclamatória trabalhista": "Trabalhista",
+        "inquérito civil": "Trabalhista", "tac": "Trabalhista",
+        "mandado de segurança": "Público", "execução fiscal": "Público",
+        "processo administrativo": "Público", "ação ordinária": "Público",
+        "impugnação ao auto": "Público", "carf": "Público", "rfb": "Público",
+        "indenizatória": "Cível", "execução de título": "Cível",
+        "monitória": "Cível", "usucapião": "Cível", "despejo": "Cível",
+        "cumprimento de sentença": "Cível", "demarcatória": "Cível",
+        "recuperação judicial": "Privado", "contrato": "Privado",
+        "due diligence": "Privado", "societário": "Privado",
+        "naturalização": "Privado", "imigração": "Privado",
+        "compliance": "Compliance", "lgpd": "Compliance",
+    }
+    PADROES_ABERTURA = [
+        r'^O[s]? caso[s]? se refere[m]? [aà][o]?\s+',
+        r'^O[s]? caso[s]? refere[m]?-se [aà][o]?\s+',
+        r'^O[s]? presente[s]? caso[s]? .{0,30}refere[m]?.se [aà][o]?\s+',
+        r'^Trata-se de\s+',
+        r'^Este (?:procedimento|processo|caso)[^,.]{0,50}[,.]\s*',
+        r'^Esta (?:demanda|ação)[^,.]{0,50}[,.]\s*',
+        r'^Bloco de \S+\s+',
+        r'^Conjunto de \S+\s+',
+        r'^(?:Ação|Ação judicial) movida\s+',
+        r'^(?:Impetrad|Imetrad)[oa]\s+',
+        r'^Distribuíd[ao]\s+',
+        r'^(?:Procedimento|Demanda|Processo) (?:instaurad|distribuid)[oa]\s+',
+    ]
 
     def _dept_header(h):
         hl = h.lower()
-        for k, v in MAPA_HEADER_DEPT_LOCAL.items():
-            if k in hl:
-                return v
+        for k, v in MAPA_HEADER_DEPT_LOC.items():
+            if k in hl: return v
         return None
 
     def _dept_conteudo(txt):
-        return inferir_dept(txt, txt)
+        tl = txt.lower()
+        for k, v in MAPA_ACAO_DEPT_LOC.items():
+            if k in tl: return v
+        return None
+
+    def _limpar_abertura(texto):
+        t = texto.strip()
+        for p in PADROES_ABERTURA:
+            novo = re.sub(p, '', t, flags=re.IGNORECASE).strip()
+            if novo != t:
+                if novo: novo = novo[0].upper() + novo[1:]
+                return novo
+        return t
+
+    def _montar_abertura(ids, titulo_gr, resumo_limpo):
+        if not resumo_limpo:
+            return resumo_limpo
+        frag = resumo_limpo[0].lower() + resumo_limpo[1:]
+        n = len(ids)
+        starts_prep = bool(re.match(r'^(?:pel[oa]s?|por|contra|perante|sobre|entre)\b', frag))
+        if n == 1:
+            return f"Processo movido {frag}" if starts_prep else f"Trata-se de {frag}"
+        else:
+            # Remove artigo definido inicial quando usado como sujeito ("o escritório X" → "escritório X")
+            frag = re.sub(r'^(?:o|a|os|as)\s+(?=\w)', '', frag).strip()
+            if frag: frag = frag[0].lower() + frag[1:]
+            if n == 2:
+                return f"As pastas {ids[0]} e {ids[1]} tratam de {frag}"
+            elif n <= 4:
+                fmt = ", ".join(ids[:-1]) + " e " + ids[-1]
+                return f"As pastas {fmt} tratam de {frag}"
+            else:
+                nome = titulo_gr or f"{n} pastas"
+                return f"O grupo '{nome}' ({n} pastas) trata de {frag}"
+
+    def _finalizar_resumo(raw):
+        r = re.sub(r'\s*\*?\s*Deliberação:\s*$', ' Deliberação:', raw.strip())
+        r = re.sub(r'\s{2,}', ' ', r).strip()
+        if r and not r.endswith("Deliberação:"):
+            r = r.rstrip(".") + ". Deliberação:"
+        return r
+
+    def _criar_caso(id_caso, titulo, dept, acao, resumo):
+        return {
+            "id_caso": id_caso, "titulo": titulo[:90], "dept": dept,
+            "acao": acao[:60], "partes": "", "orgao": "", "valor": "",
+            "historico": "", "ultimo": "", "n_and": 0,
+            "data_distribuicao": "", "resumo_manual": resumo,
+        }
 
     casos = []
     linhas = texto_bruto.splitlines()
@@ -105,153 +176,97 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
     i = 0
 
     while i < len(linhas):
-        linha = linhas[i].strip()
+        l = linhas[i].strip()
 
-        # ── Cabeçalho de área (### BCA / Área / ...)
-        if re.match(r'^#{1,4}\s', linha):
-            d = _dept_header(linha)
-            if d:
-                dept_atual = d
-            i += 1
-            continue
+        # ── Linha vazia / separador / label de seção (CONTRATOS, SERVIÇOS...)
+        if not l or re.match(r'^-{3,}$', l) or re.match(r'^(?:CONTRATOS|SERVI.OS|PROCESSOS|DOCS|SERV)\b', l):
+            i += 1; continue
 
-        # ── Separador horizontal
-        if re.match(r'^-{3,}$', linha):
-            i += 1
-            continue
+        # ── Cabeçalho de área (com ou sem ###, BCA/ ou CA/)
+        if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l):
+            d = _dept_header(l)
+            if d: dept_atual = d
+            i += 1; continue
 
-        # ── FORMATO A: **Pastas: Proc-X, Proc-Y (Título)**
+        # ══ FORMATO A — **Pastas: ...** ══════════════════════════
         m_a = re.match(
-            r'^\*{0,2}Pastas?\s*:\s*([^\*(]+?)(?:\s*\(([^)]+)\))?\*{0,2}\s*$',
-            linha, re.IGNORECASE
+            r'^\*{1,2}Pastas?\s*:\s*([^*(]+?)(?:\s*\(([^)]+)\))?\*{0,2}\s*$',
+            l, re.IGNORECASE
         )
         if m_a:
             ids_raw   = m_a.group(1).strip()
             titulo_gr = (m_a.group(2) or "").strip()
-            ids = re.findall(r'(?:Proc|proc)-\d+', ids_raw)
-            if not ids:
-                ids = [ids_raw]
-
-            # Coleta parágrafo de resumo nas linhas seguintes
+            ids = re.findall(r'(?:Proc|Doc|Serv)-\d+', ids_raw, re.IGNORECASE)
+            if not ids: ids = [ids_raw]
             i += 1
             res_lines = []
             while i < len(linhas):
-                l = linhas[i].strip()
-                if re.match(r'^#{1,4}\s', l): break
-                if re.match(r'^\*{0,2}Pastas?\s*:', l, re.IGNORECASE): break
-                if re.match(r'^Pasta\s*:', l, re.IGNORECASE): break
-                if re.match(r'^-{3,}$', l): break
-                res_lines.append(l)
-                i += 1
-
-            resumo = " ".join(res_lines).strip()
-            resumo = re.sub(r'\s*\*\s*Deliberação:\s*$', ' Deliberação:', resumo)
-            resumo = re.sub(r'\s{2,}', ' ', resumo).strip()
-            if resumo and not resumo.endswith("Deliberação:"):
-                resumo = resumo.rstrip(".") + ". Deliberação:"
-
-            # ── Ajusta abertura do resumo conforme número de pastas ──────────
-            # Padrões genéricos que o Gemini costuma usar como abertura
-            _PADROES_ABERTURA = [
-                r'^O[s]? caso[s]? se refere[m]? a[o]?\s+',
-                r'^O[s]? presente[s]? caso[s]? se refere[m]? a[o]?\s+',
-                r'^Trata-se de\s+',
-                r'^Os presentes casos tratam de\s+',
-            ]
-            resumo_limpo = resumo
-            for _pat in _PADROES_ABERTURA:
-                _novo = re.sub(_pat, '', resumo_limpo, flags=re.IGNORECASE).strip()
-                if _novo != resumo_limpo:
-                    resumo_limpo = _novo
-                    break  # aplica apenas o primeiro padrão que bater
-
-            # Capitaliza após remoção
-            if resumo_limpo:
-                resumo_limpo = resumo_limpo[0].upper() + resumo_limpo[1:]
-
-            n_ids = len(ids)
-            if n_ids == 1:
-                # Processo único — abre com "Trata-se de"
-                abertura = "Trata-se de "
-            elif n_ids == 2:
-                # Par — nomeia as duas pastas
-                abertura = f"As pastas {ids[0]} e {ids[1]} tratam de "
-            elif n_ids <= 4:
-                # Grupo pequeno — lista todas
-                ids_fmt = ", ".join(ids[:-1]) + " e " + ids[-1]
-                abertura = f"As pastas {ids_fmt} tratam de "
-            else:
-                # Grupo grande (5+) — referencia pelo título do grupo
-                nome_grupo = titulo_gr if titulo_gr else f"{n_ids} pastas"
-                abertura = f"O grupo '{nome_grupo}' ({n_ids} pastas) trata de "
-
-            resumo = abertura + resumo_limpo[0].lower() + resumo_limpo[1:]
-
+                l2 = linhas[i].strip()
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\*{1,2}Pastas?\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^-{3,}$', l2): break
+                res_lines.append(l2); i += 1
+            raw   = _finalizar_resumo(" ".join(res_lines))
+            limpo = _limpar_abertura(raw)
+            resumo = _montar_abertura(ids, titulo_gr, limpo)
             dept_caso = _dept_conteudo(titulo_gr + " " + resumo) or dept_atual
-
-            casos.append({
-                "id_caso":          " | ".join(ids),
-                "titulo":           titulo_gr[:90] or " | ".join(ids[:2]),
-                "dept":             dept_caso,
-                "acao":             titulo_gr[:60],
-                "partes":           "", "orgao": "", "valor": "",
-                "historico":        "", "ultimo": "", "n_and": 0,
-                "data_distribuicao": "",
-                "resumo_manual":    resumo,
-            })
+            casos.append(_criar_caso(" | ".join(ids), titulo_gr or ids[0], dept_caso, titulo_gr, resumo))
             continue
 
-        # ── FORMATO B: Pasta: Proc-0001 (linha isolada)
-        m_b = re.match(r'^Pasta\s*:\s*(\S.*)', linha, re.IGNORECASE)
-        if m_b:
-            caso = {
-                "id_caso": m_b.group(1).strip(), "titulo": "", "dept": dept_atual,
-                "acao": "", "partes": "", "orgao": "", "valor": "",
-                "historico": "", "ultimo": "", "n_and": 0,
-                "data_distribuicao": "", "resumo_manual": "",
-            }
+        # ══ FORMATO B1 — Pasta: Proc-XXXX (Tipo) Resumo inline ══
+        m_b1 = re.match(r'^Pasta\s*:\s*(\S+)\s+\(([^)]+)\)\s*(.*)', l, re.IGNORECASE)
+        if m_b1:
+            id_caso = m_b1.group(1).strip()
+            tipo    = m_b1.group(2).strip()
+            resumo_inline = m_b1.group(3).strip()
             i += 1
-            hist_mode = False
-            hist_lines = []
+            cont = [resumo_inline] if resumo_inline else []
             while i < len(linhas):
-                l = linhas[i].strip()
-                if not l and not hist_mode:
-                    i += 1; break
-                if re.match(r'^Pasta\s*:', l, re.IGNORECASE): break
-                if re.match(r'^\*{0,2}Pastas?\s*:', l, re.IGNORECASE): break
-                if hist_mode:
-                    if l: hist_lines.append(l)
-                else:
-                    for pat, key in [
-                        (r'(?i)^a[çc][ãa]o\s*:', "acao"),
-                        (r'(?i)^partes?\s*:', "partes"),
-                        (r'(?i)^[oó]rg[aã]o\s*:', "orgao"),
-                        (r'(?i)^valor\s*:', "valor"),
-                        (r'(?i)^distribu[ií]d[oa]\s+em\s*:', "data_distribuicao"),
-                        (r'(?i)^[áa]rea\s*:', "dept"),
-                        (r'(?i)^resumo\s*:', "resumo_manual"),
-                    ]:
-                        mm = re.match(pat + r'\s*(.*)', l)
-                        if mm:
-                            caso[key] = mm.group(1).strip(); break
-                    if re.match(r'(?i)^andamentos\s*:', l):
-                        hist_mode = True
-                i += 1
-            caso["historico"] = "\n".join(hist_lines)
-            caso["n_and"]     = len(hist_lines)
-            caso["ultimo"]    = hist_lines[0] if hist_lines else ""
-            d2 = _dept_conteudo(caso["acao"])
-            if d2: caso["dept"] = d2
-            caso["titulo"] = (
-                f"{caso['acao']} — {caso['partes'][:50]}" if caso["acao"]
-                else caso["id_caso"]
-            )
-            casos.append(caso)
+                l2 = linhas[i].strip()
+                if not l2: break
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                cont.append(l2); i += 1
+            raw   = _finalizar_resumo(" ".join(cont))
+            limpo = _limpar_abertura(raw)
+            resumo = f"Trata-se de {limpo[0].lower()}{limpo[1:]}" if limpo else ""
+            dept_caso = _dept_conteudo(tipo + " " + resumo) or dept_atual
+            casos.append(_criar_caso(id_caso, f"{tipo} — {id_caso}", dept_caso, tipo, resumo))
+            continue
+
+        # ══ FORMATO B2 — Grupo: Título (Pastas: Proc-X, ...) Resumo inline ══
+        m_b2 = re.match(
+            r'^Grupo\s*:\s*([^(]+?)\s*\(\s*Pastas?\s*:\s*([^)]+)\)\s*(.*)',
+            l, re.IGNORECASE
+        )
+        if m_b2:
+            titulo_gr = m_b2.group(1).strip()
+            ids_raw   = m_b2.group(2).strip()
+            resumo_inline = m_b2.group(3).strip()
+            ids = re.findall(r'(?:Proc|Doc|Serv)-\d+', ids_raw, re.IGNORECASE)
+            if not ids: ids = [ids_raw]
+            i += 1
+            cont = [resumo_inline] if resumo_inline else []
+            while i < len(linhas):
+                l2 = linhas[i].strip()
+                if not l2: break
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                cont.append(l2); i += 1
+            raw   = _finalizar_resumo(" ".join(cont))
+            limpo = _limpar_abertura(raw)
+            resumo = _montar_abertura(ids, titulo_gr, limpo)
+            dept_caso = _dept_conteudo(titulo_gr + " " + resumo) or dept_atual
+            casos.append(_criar_caso(" | ".join(ids), titulo_gr, dept_caso, titulo_gr, resumo))
             continue
 
         i += 1
 
     return pd.DataFrame(casos) if casos else pd.DataFrame()
+
 
 
 # ─────────────────────────────────────────────────────────────
