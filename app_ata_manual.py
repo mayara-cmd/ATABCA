@@ -194,10 +194,18 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
         }
 
     # ── Pré-processamento: normalizar texto colado sem quebras de linha adequadas ──
-    # Insere \n antes de palavras-chave estruturais e cabeçalhos de seção
+    # 1. Separar cabeçalhos numéricos ("1. PALAVRA /...")
     texto_bruto = re.sub(r'([^\n])(\d+\.\s+[A-ZÁÉÍÓÚÀÂÊÎÔÛÃẼÕÜ])', r'\1\n\2', texto_bruto)
+    # 2. Separar o nome do departamento do conteúdo que vem colado logo após ("/ Cível<Título>")
+    texto_bruto = re.sub(
+        r'(/\s*(?:Direito\s+(?:Privado|P[úu]blico)|Contencioso\s+C[íi]vel|Trabalhista|Compliance))\s*([^\n/])',
+        r'\1\n\2', texto_bruto, flags=re.IGNORECASE
+    )
+    # 3. Separar palavras-chave estruturais (Deliberação:, Grupo:, Pasta:)
     for _kw in ['Deliberação', 'Grupo', 'Pastas?']:
         texto_bruto = re.sub(r'([^\n])(' + _kw + r'\s*:)', r'\1\n\2', texto_bruto, flags=re.IGNORECASE)
+    # 4. Separar marcadores Markdown "###" quando aparecem colados a outro texto
+    texto_bruto = re.sub(r'([^\n])(#{1,4}\s)', r'\1\n\2', texto_bruto)
     texto_bruto = re.sub(r'\n{3,}', '\n\n', texto_bruto)
 
     casos = []
@@ -351,6 +359,38 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
                 if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
                 if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
                 if re.match(r'^\d+\.\s+.+/', l2): break
+                if re.match(r'^#{0,4}\s*.+\((?:Proc|Doc|Serv)-\d+', l2, re.IGNORECASE) and l2.rstrip().endswith(')'): break
+                cont.append(l2); i += 1
+            raw = _finalizar_resumo(" ".join(cont))
+            limpo = _limpar_abertura(raw)
+            resumo = _montar_abertura(ids, titulo_gr, limpo)
+            dept_caso = _dept_conteudo(titulo_gr + " " + resumo) or dept_atual
+            casos.append(_criar_caso(" | ".join(ids), titulo_gr, dept_caso, titulo_gr, resumo))
+            continue
+
+        # ══ FORMATO D — Título (ID1, ID2, ...) sem prefixo Grupo/Pasta ══
+        # Captura linhas como "### Título (Proc-X, Serv-Y)" ou "Título (Serv-X, Serv-Y)"
+        _PAT_IDS = r'(?:Proc|Doc|Serv)-\d+'
+        m_d = re.match(
+            r'^#{0,4}\s*(.+?)\s*\(((?:' + _PAT_IDS + r')(?:[,;\s]+' + _PAT_IDS + r')*)\)\s*$',
+            l, re.IGNORECASE
+        )
+        if m_d:
+            titulo_gr = m_d.group(1).strip()
+            ids = re.findall(_PAT_IDS, m_d.group(2), re.IGNORECASE)
+            if not ids: ids = [titulo_gr]
+            i += 1
+            cont = []
+            while i < len(linhas):
+                l2 = linhas[i].strip()
+                if not l2: i += 1; continue
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\d+\.\s+.+/', l2): break
+                # Próximo título com IDs entre parênteses no final da linha
+                if re.match(r'^#{0,4}\s*.+\((?:Proc|Doc|Serv)-\d+', l2, re.IGNORECASE) and l2.rstrip().endswith(')'):
+                    break
                 cont.append(l2); i += 1
             raw = _finalizar_resumo(" ".join(cont))
             limpo = _limpar_abertura(raw)
@@ -855,8 +895,9 @@ with aba_pdf:
                     "Órgão": "orgao",
                 }
 
-                def cel(row, i):
-                    return (row[i] or "").strip() if i < len(row) else ""
+                def cells(row):
+                    """Retorna lista de strings limpas de uma linha de tabela."""
+                    return [(c or "").strip() for c in (row or [])]
 
                 casos_pdf = []
                 caso_pdf = None
@@ -868,18 +909,14 @@ with aba_pdf:
                     historico = "\n".join(f"[{a['data']}] {a['desc']}" for a in ands)
                     ultimo = ands[0]["desc"] if ands else ""
                     esc = caso_pdf.get("escritorio", "").lower()
-                    if "trabalhista" in esc:
-                        dept = "Trabalhista"
-                    elif "público" in esc or "publico" in esc:
-                        dept = "Público"
-                    elif "cível" in esc or "conflitos" in esc:
-                        dept = "Cível"
-                    elif "privado" in esc:
-                        dept = "Privado"
-                    elif "compliance" in esc:
-                        dept = "Compliance"
-                    else:
-                        dept = inferir_dept(caso_pdf.get("acao", ""))
+                    dept = (
+                        "Trabalhista" if "trabalhist" in esc else
+                        "Público"     if any(k in esc for k in ("público", "publico")) else
+                        "Cível"       if any(k in esc for k in ("cível", "civil", "conflitos")) else
+                        "Privado"     if "privado" in esc else
+                        "Compliance"  if "compliance" in esc else
+                        inferir_dept(caso_pdf.get("acao", ""))
+                    )
                     cliente = caso_pdf.get("cliente", "").replace("(filial cliente principal)", "").strip()
                     contrario = caso_pdf.get("contrario", "")
                     casos_pdf.append({
@@ -893,25 +930,62 @@ with aba_pdf:
                         "resumo_manual": "",
                     })
 
+                _PAT_PASTA = re.compile(r'^(?:Proc|Doc|Serv)-\d+', re.IGNORECASE)
+                _PAT_DATA  = re.compile(r'^\d{2}/\d{2}/\d{4}$')
+
                 with pdfplumber.open(uploaded_file) as pdf:
                     for page in pdf.pages:
-                        for tab in page.extract_tables():
+                        for tab in (page.extract_tables() or []):
                             for row in tab:
-                                if cel(row, 1) == "Pasta" and cel(row, 2).startswith("Proc"):
-                                    salvar_pdf()
-                                    caso_pdf = {"_pasta": cel(row, 2).replace(" ", ""), "_ands": []}
+                                cs = cells(row)
+                                if not any(cs):
                                     continue
+
+                                # ── Detectar linha de nova Pasta (busca flexível por posição) ──
+                                pasta_id = None
+                                has_pasta_label = any(c.lower() == "pasta" for c in cs)
+                                if has_pasta_label:
+                                    for c in cs:
+                                        if _PAT_PASTA.match(c):
+                                            pasta_id = c.replace(" ", "")
+                                            break
+                                if pasta_id:
+                                    salvar_pdf()
+                                    caso_pdf = {"_pasta": pasta_id, "_ands": []}
+                                    continue
+
                                 if caso_pdf is None:
                                     continue
-                                campo = cel(row, 2)
-                                if campo in CAMPOS:
-                                    caso_pdf[CAMPOS[campo]] = cel(row, 6)
+
+                                # ── Detectar campo de metadado (rótulo → valor) ──
+                                campo_encontrado = False
+                                for j, c in enumerate(cs):
+                                    if c in CAMPOS:
+                                        # Valor: primeiro conteúdo não-vazio após o rótulo
+                                        for k in range(j + 1, len(cs)):
+                                            if cs[k]:
+                                                caso_pdf[CAMPOS[c]] = cs[k]
+                                                break
+                                        campo_encontrado = True
+                                        break
+                                if campo_encontrado:
                                     continue
-                                data_c = cel(row, 3)
-                                tipo_c = cel(row, 5)
-                                desc_c = cel(row, 10)
-                                if re.match(r"\d{2}/\d{2}/\d{4}", data_c) and "Andamento" in tipo_c and desc_c:
-                                    caso_pdf["_ands"].append({"data": data_c, "desc": " ".join(desc_c.split())})
+
+                                # ── Detectar linha de Andamento (data em qualquer posição) ──
+                                for j, c in enumerate(cs):
+                                    if _PAT_DATA.match(c):
+                                        # Aceita a linha se contém "andamento" ou se há descrição
+                                        tem_andamento = any("andamento" in (cs[k] or "").lower() for k in range(len(cs)))
+                                        desc_parts = [
+                                            cs[k] for k in range(j + 1, len(cs))
+                                            if cs[k] and not _PAT_DATA.match(cs[k])
+                                            and cs[k].lower() not in ("andamento", "")
+                                        ]
+                                        desc = " ".join(desc_parts).strip()
+                                        if desc and (tem_andamento or len(desc) > 10):
+                                            caso_pdf["_ands"].append({"data": c, "desc": " ".join(desc.split())})
+                                        break
+
                 salvar_pdf()
                 return pd.DataFrame(casos_pdf)
 
