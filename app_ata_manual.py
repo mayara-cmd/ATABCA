@@ -75,7 +75,20 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
 
         Deliberação:
 
-    Os dois formatos podem coexistir no mesmo texto.
+    FORMATO C (ATA com cabeçalhos numéricos — Grupo + Pastas separados):
+        1. ÁREA OPERACIONAL / CONTENCIOSO CÍVEL
+        Grupo: Título do Grupo (N Casos)
+        Pastas: Proc-0001, Proc-0002
+        Resumo do grupo em parágrafo...
+        Deliberação: ---
+
+    FORMATO B1b (Pasta sem tipo — conteúdo nas linhas seguintes):
+        Pasta: Proc-0001717
+        Resumo do caso...
+        Deliberação:
+
+    Os formatos podem coexistir no mesmo texto.
+    Texto colado sem quebras de linha entre palavras-chave é normalizado automaticamente.
     """
     MAPA_HEADER_DEPT_LOC = {
         "cível":       "Cível",   "civil":       "Cível",   "conflitos": "Cível",
@@ -85,17 +98,27 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
         "compliance":  "Compliance",
     }
     MAPA_ACAO_DEPT_LOC = {
+        # Trabalhista — verificado antes de "processo administrativo" (genérico)
         "reclamação trabalhista": "Trabalhista", "reclamatória trabalhista": "Trabalhista",
+        "ministério público do trabalho": "Trabalhista", "sinpospetro": "Trabalhista",
         "inquérito civil": "Trabalhista", "tac": "Trabalhista",
+        # Compliance — verificado antes de "processo administrativo"
+        "inquérito policial": "Compliance", "falsidade ideológica": "Compliance",
+        # Público — específicos (antes de "processo administrativo")
         "mandado de segurança": "Público", "execução fiscal": "Público",
-        "processo administrativo": "Público", "ação ordinária": "Público",
         "impugnação ao auto": "Público", "carf": "Público", "rfb": "Público",
+        # Cível — específicos verificados ANTES de "processo administrativo" genérico
         "indenizatória": "Cível", "execução de título": "Cível",
         "monitória": "Cível", "usucapião": "Cível", "despejo": "Cível",
         "cumprimento de sentença": "Cível", "demarcatória": "Cível",
+        "anulatória": "Cível", "demarcação": "Cível",
+        # Privado — específicos
         "recuperação judicial": "Privado", "contrato": "Privado",
         "due diligence": "Privado", "societário": "Privado",
         "naturalização": "Privado", "imigração": "Privado",
+        # Público — genérico (último recurso, após Cível específicos)
+        "processo administrativo": "Público", "ação ordinária": "Público",
+        # Compliance genérico
         "compliance": "Compliance", "lgpd": "Compliance",
     }
     PADROES_ABERTURA = [
@@ -170,6 +193,13 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
             "data_distribuicao": "", "resumo_manual": resumo,
         }
 
+    # ── Pré-processamento: normalizar texto colado sem quebras de linha adequadas ──
+    # Insere \n antes de palavras-chave estruturais e cabeçalhos de seção
+    texto_bruto = re.sub(r'([^\n])(\d+\.\s+[A-ZÁÉÍÓÚÀÂÊÎÔÛÃẼÕÜ])', r'\1\n\2', texto_bruto)
+    for _kw in ['Deliberação', 'Grupo', 'Pastas?']:
+        texto_bruto = re.sub(r'([^\n])(' + _kw + r'\s*:)', r'\1\n\2', texto_bruto, flags=re.IGNORECASE)
+    texto_bruto = re.sub(r'\n{3,}', '\n\n', texto_bruto)
+
     casos = []
     linhas = texto_bruto.splitlines()
     dept_atual = "Cível"
@@ -180,6 +210,20 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
 
         # ── Linha vazia / separador / label de seção (CONTRATOS, SERVIÇOS...)
         if not l or re.match(r'^-{3,}$', l) or re.match(r'^(?:CONTRATOS|SERVI.OS|PROCESSOS|DOCS|SERV)\b', l):
+            i += 1; continue
+
+        # ── Linha de Deliberação (separador — aparece isolada após normalização)
+        if re.match(r'^Deliberação\s*:', l, re.IGNORECASE):
+            i += 1; continue
+
+        # ── Linha Pastas: standalone (órfã ou já consumida por Formato C)
+        if re.match(r'^Pastas\s*:', l, re.IGNORECASE) and not re.match(r'^\*', l):
+            i += 1; continue
+
+        # ── Cabeçalho numérico de área (1. ÁREA OPERACIONAL / X)
+        if re.match(r'^\d+\.\s+.+/', l):
+            d = _dept_header(l)
+            if d: dept_atual = d
             i += 1; continue
 
         # ── Cabeçalho de área (com ou sem ###, BCA/ ou CA/)
@@ -228,12 +272,34 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
                 if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
                 if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
                 if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\d+\.\s+.+/', l2): break
                 cont.append(l2); i += 1
             raw   = _finalizar_resumo(" ".join(cont))
             limpo = _limpar_abertura(raw)
             resumo = f"Trata-se de {limpo[0].lower()}{limpo[1:]}" if limpo else ""
             dept_caso = _dept_conteudo(tipo + " " + resumo) or dept_atual
             casos.append(_criar_caso(id_caso, f"{tipo} — {id_caso}", dept_caso, tipo, resumo))
+            continue
+
+        # ══ FORMATO B1b — Pasta: Proc-XXXX (sem tipo, conteúdo nas linhas seguintes) ══
+        m_b1b = re.match(r'^Pasta\s*:\s*((?:Proc|Doc|Serv)-\d+)\s*$', l, re.IGNORECASE)
+        if m_b1b:
+            id_caso = m_b1b.group(1).strip()
+            i += 1
+            cont = []
+            while i < len(linhas):
+                l2 = linhas[i].strip()
+                if not l2: i += 1; continue
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\d+\.\s+.+/', l2): break
+                cont.append(l2); i += 1
+            raw = _finalizar_resumo(" ".join(cont))
+            limpo = _limpar_abertura(raw)
+            resumo = f"Trata-se de {limpo[0].lower()}{limpo[1:]}" if limpo else ""
+            dept_caso = _dept_conteudo(resumo) or dept_atual
+            casos.append(_criar_caso(id_caso, id_caso, dept_caso, "", resumo))
             continue
 
         # ══ FORMATO B2 — Grupo: Título (Pastas: Proc-X, ...) Resumo inline ══
@@ -255,8 +321,38 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
                 if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
                 if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
                 if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\d+\.\s+.+/', l2): break
                 cont.append(l2); i += 1
             raw   = _finalizar_resumo(" ".join(cont))
+            limpo = _limpar_abertura(raw)
+            resumo = _montar_abertura(ids, titulo_gr, limpo)
+            dept_caso = _dept_conteudo(titulo_gr + " " + resumo) or dept_atual
+            casos.append(_criar_caso(" | ".join(ids), titulo_gr, dept_caso, titulo_gr, resumo))
+            continue
+
+        # ══ FORMATO C — Grupo: Título (N Casos) + Pastas: na linha seguinte ══
+        m_c = re.match(r'^Grupo\s*:\s*(.+)\s*$', l, re.IGNORECASE)
+        if m_c:
+            titulo_gr = re.sub(r'\s*\(\d+\s*[Cc]asos?\)\s*$', '', m_c.group(1)).strip()
+            i += 1
+            ids = []
+            if i < len(linhas):
+                l_next = linhas[i].strip()
+                m_p = re.match(r'^Pastas?\s*:\s*(.+)', l_next, re.IGNORECASE)
+                if m_p:
+                    ids = re.findall(r'(?:Proc|Doc|Serv)-\d+', m_p.group(1), re.IGNORECASE)
+                    i += 1
+            if not ids: ids = [titulo_gr]
+            cont = []
+            while i < len(linhas):
+                l2 = linhas[i].strip()
+                if not l2: i += 1; continue
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\d+\.\s+.+/', l2): break
+                cont.append(l2); i += 1
+            raw = _finalizar_resumo(" ".join(cont))
             limpo = _limpar_abertura(raw)
             resumo = _montar_abertura(ids, titulo_gr, limpo)
             dept_caso = _dept_conteudo(titulo_gr + " " + resumo) or dept_atual
