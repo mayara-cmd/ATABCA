@@ -201,16 +201,27 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
         r'(/\s*(?:Direito\s+(?:Privado|P[úu]blico)|Contencioso\s+C[íi]vel|Trabalhista|Compliance))\s*([^\n/])',
         r'\1\n\2', texto_bruto, flags=re.IGNORECASE
     )
-    # 3. Separar palavras-chave estruturais (Deliberação:, Grupo:, Pasta:)
-    for _kw in ['Deliberação', 'Grupo', 'Pastas?']:
+    # 3. Separar palavras-chave estruturais (Deliberação:, Grupo:, Pasta(s):)
+    for _kw in ['Deliberação', 'Grupo', 'Pastas?', 'Pasta']:
         texto_bruto = re.sub(r'([^\n])(' + _kw + r'\s*:)', r'\1\n\2', texto_bruto, flags=re.IGNORECASE)
     # 4. Separar marcadores Markdown "###" quando aparecem colados a outro texto
     texto_bruto = re.sub(r'([^\n])(#{1,4}\s)', r'\1\n\2', texto_bruto)
+    # 5. Separar antes e depois de "Casos Individuais" e metadados de data
+    for _kw2 in ['Casos Individuais', r'Data de (?:distribuição|solicitação)\s*:']:
+        texto_bruto = re.sub(r'([^\n])(' + _kw2 + r')', r'\1\n\2', texto_bruto, flags=re.IGNORECASE)
+    # 5b. Separar conteúdo que começa logo após "Casos Individuais" (sem espaço)
+    texto_bruto = re.sub(r'(Casos Individuais)([^\n])', r'\1\n\2', texto_bruto, flags=re.IGNORECASE)
+    # 5c. Separar conteúdo que segue imediatamente a um metadado de data ("...2026.O caso")
+    texto_bruto = re.sub(
+        r'(Data de (?:distribuição|solicitação)[^\n]+?\.)\s*([A-ZÁÉÍÓÚÀÂÊÎÔÛÃÕ])',
+        r'\1\n\2', texto_bruto, flags=re.IGNORECASE
+    )
     texto_bruto = re.sub(r'\n{3,}', '\n\n', texto_bruto)
 
     casos = []
     linhas = texto_bruto.splitlines()
     dept_atual = "Cível"
+    titulo_pendente = ""
     i = 0
 
     while i < len(linhas):
@@ -220,24 +231,63 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
         if not l or re.match(r'^-{3,}$', l) or re.match(r'^(?:CONTRATOS|SERVI.OS|PROCESSOS|DOCS|SERV)\b', l):
             i += 1; continue
 
-        # ── Linha de Deliberação (separador — aparece isolada após normalização)
-        if re.match(r'^Deliberação\s*:', l, re.IGNORECASE):
+        # ── Label "Casos Individuais" (separador de seção — não contém dados)
+        if re.match(r'^Casos Individuais\b', l, re.IGNORECASE):
             i += 1; continue
 
-        # ── Linha Pastas: standalone (órfã ou já consumida por Formato C)
-        if re.match(r'^Pastas\s*:', l, re.IGNORECASE) and not re.match(r'^\*', l):
+        # ── Linhas de metadados de data (standalone após normalização)
+        if re.match(r'^Data de (?:distribuição|solicitação)\s*:', l, re.IGNORECASE):
             i += 1; continue
+
+        # ── Linha de Deliberação — extrai título pendente se houver conteúdo após
+        if re.match(r'^Deliberação\s*:', l, re.IGNORECASE):
+            resto = re.sub(r'^Deliberação\s*:\s*', '', l, flags=re.IGNORECASE).strip()
+            resto = re.sub(r'^-+\s*', '', resto).strip()  # remover "---"
+            resto = re.sub(r'^Casos Individuais\s*', '', resto, flags=re.IGNORECASE).strip()
+            if resto:
+                titulo_pendente = resto
+            i += 1; continue
+
+        # ══ FORMATO E — Pastas: standalone com titulo_pendente ══
+        m_e = re.match(r'^Pastas?\s*:\s*(.+)', l, re.IGNORECASE)
+        if m_e and not l.startswith('*'):
+            ids = re.findall(r'(?:Proc|Doc|Serv)-\d+', m_e.group(1), re.IGNORECASE)
+            titulo_gr = titulo_pendente or (ids[0] if ids else l)
+            titulo_pendente = ""
+            if not ids: ids = [titulo_gr]
+            i += 1
+            cont = []
+            while i < len(linhas):
+                l2 = linhas[i].strip()
+                if not l2: i += 1; continue
+                if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
+                if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
+                if re.match(r'^\d+\.\s+.+/', l2): break
+                if re.match(r'^#{0,4}\s*.+\((?:Proc|Doc|Serv)-\d+', l2, re.IGNORECASE) and l2.rstrip().endswith(')'): break
+                if re.match(r'^Pastas?\s*:', l2, re.IGNORECASE): break
+                if re.match(r'^Data de (?:distribuição|solicitação)\s*:', l2, re.IGNORECASE): i += 1; continue
+                if re.match(r'^Casos Individuais\b', l2, re.IGNORECASE): i += 1; continue
+                cont.append(l2); i += 1
+            raw = _finalizar_resumo(" ".join(cont))
+            limpo = _limpar_abertura(raw)
+            resumo = _montar_abertura(ids, titulo_gr, limpo)
+            dept_caso = _dept_conteudo(titulo_gr + " " + resumo) or dept_atual
+            casos.append(_criar_caso(" | ".join(ids), titulo_gr, dept_caso, titulo_gr, resumo))
+            continue
 
         # ── Cabeçalho numérico de área (1. ÁREA OPERACIONAL / X)
         if re.match(r'^\d+\.\s+.+/', l):
             d = _dept_header(l)
             if d: dept_atual = d
+            titulo_pendente = ""
             i += 1; continue
 
         # ── Cabeçalho de área (com ou sem ###, BCA/ ou CA/)
         if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l):
             d = _dept_header(l)
             if d: dept_atual = d
+            titulo_pendente = ""
             i += 1; continue
 
         # ══ FORMATO A — **Pastas: ...** ══════════════════════════
@@ -246,6 +296,7 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
             l, re.IGNORECASE
         )
         if m_a:
+            titulo_pendente = ""
             ids_raw   = m_a.group(1).strip()
             titulo_gr = (m_a.group(2) or "").strip()
             ids = re.findall(r'(?:Proc|Doc|Serv)-\d+', ids_raw, re.IGNORECASE)
@@ -269,6 +320,7 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
         # ══ FORMATO B1 — Pasta: Proc-XXXX (Tipo) Resumo inline ══
         m_b1 = re.match(r'^Pasta\s*:\s*(\S+)\s+\(([^)]+)\)\s*(.*)', l, re.IGNORECASE)
         if m_b1:
+            titulo_pendente = ""
             id_caso = m_b1.group(1).strip()
             tipo    = m_b1.group(2).strip()
             resumo_inline = m_b1.group(3).strip()
@@ -289,25 +341,29 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
             casos.append(_criar_caso(id_caso, f"{tipo} — {id_caso}", dept_caso, tipo, resumo))
             continue
 
-        # ══ FORMATO B1b — Pasta: Proc-XXXX (sem tipo, conteúdo nas linhas seguintes) ══
-        m_b1b = re.match(r'^Pasta\s*:\s*((?:Proc|Doc|Serv)-\d+)\s*$', l, re.IGNORECASE)
+        # ══ FORMATO B1b — Pasta: Proc-XXXX [| metadata] (sem tipo) ══
+        m_b1b = re.match(r'^Pasta\s*:\s*((?:Proc|Doc|Serv)-\d+)\s*(?:\|.*)?$', l, re.IGNORECASE)
         if m_b1b:
             id_caso = m_b1b.group(1).strip()
+            titulo_caso = titulo_pendente or id_caso
+            titulo_pendente = ""
             i += 1
             cont = []
             while i < len(linhas):
                 l2 = linhas[i].strip()
                 if not l2: i += 1; continue
                 if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
-                if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
                 if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
                 if re.match(r'^\d+\.\s+.+/', l2): break
+                if re.match(r'^Data de (?:distribuição|solicitação)\s*:', l2, re.IGNORECASE): i += 1; continue
+                if re.match(r'^Casos Individuais\b', l2, re.IGNORECASE): i += 1; continue
                 cont.append(l2); i += 1
             raw = _finalizar_resumo(" ".join(cont))
             limpo = _limpar_abertura(raw)
             resumo = f"Trata-se de {limpo[0].lower()}{limpo[1:]}" if limpo else ""
-            dept_caso = _dept_conteudo(resumo) or dept_atual
-            casos.append(_criar_caso(id_caso, id_caso, dept_caso, "", resumo))
+            dept_caso = _dept_conteudo(titulo_caso + " " + resumo) or dept_atual
+            casos.append(_criar_caso(id_caso, titulo_caso, dept_caso, "", resumo))
             continue
 
         # ══ FORMATO B2 — Grupo: Título (Pastas: Proc-X, ...) Resumo inline ══
@@ -316,6 +372,7 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
             l, re.IGNORECASE
         )
         if m_b2:
+            titulo_pendente = ""
             titulo_gr = m_b2.group(1).strip()
             ids_raw   = m_b2.group(2).strip()
             resumo_inline = m_b2.group(3).strip()
@@ -341,6 +398,7 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
         # ══ FORMATO C — Grupo: Título (N Casos) + Pastas: na linha seguinte ══
         m_c = re.match(r'^Grupo\s*:\s*(.+)\s*$', l, re.IGNORECASE)
         if m_c:
+            titulo_pendente = ""
             titulo_gr = re.sub(r'\s*\(\d+\s*[Cc]asos?\)\s*$', '', m_c.group(1)).strip()
             i += 1
             ids = []
@@ -356,10 +414,12 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
                 l2 = linhas[i].strip()
                 if not l2: i += 1; continue
                 if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
-                if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
                 if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
                 if re.match(r'^\d+\.\s+.+/', l2): break
                 if re.match(r'^#{0,4}\s*.+\((?:Proc|Doc|Serv)-\d+', l2, re.IGNORECASE) and l2.rstrip().endswith(')'): break
+                if re.match(r'^Data de (?:distribuição|solicitação)\s*:', l2, re.IGNORECASE): i += 1; continue
+                if re.match(r'^Casos Individuais\b', l2, re.IGNORECASE): i += 1; continue
                 cont.append(l2); i += 1
             raw = _finalizar_resumo(" ".join(cont))
             limpo = _limpar_abertura(raw)
@@ -376,6 +436,7 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
             l, re.IGNORECASE
         )
         if m_d:
+            titulo_pendente = ""
             titulo_gr = m_d.group(1).strip()
             ids = re.findall(_PAT_IDS, m_d.group(2), re.IGNORECASE)
             if not ids: ids = [titulo_gr]
@@ -385,12 +446,14 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
                 l2 = linhas[i].strip()
                 if not l2: i += 1; continue
                 if re.match(r'^(?:Pasta|Grupo)\s*:', l2, re.IGNORECASE): break
-                if re.match(r'^Deliberação:', l2, re.IGNORECASE): i += 1; break
+                if re.match(r'^Deliberação:', l2, re.IGNORECASE): break
                 if re.match(r'^#{0,4}\s*(?:BCA|CA)\s*/', l2): break
                 if re.match(r'^\d+\.\s+.+/', l2): break
                 # Próximo título com IDs entre parênteses no final da linha
                 if re.match(r'^#{0,4}\s*.+\((?:Proc|Doc|Serv)-\d+', l2, re.IGNORECASE) and l2.rstrip().endswith(')'):
                     break
+                if re.match(r'^Data de (?:distribuição|solicitação)\s*:', l2, re.IGNORECASE): i += 1; continue
+                if re.match(r'^Casos Individuais\b', l2, re.IGNORECASE): i += 1; continue
                 cont.append(l2); i += 1
             raw = _finalizar_resumo(" ".join(cont))
             limpo = _limpar_abertura(raw)
@@ -399,6 +462,8 @@ def parsear_texto_livre(texto_bruto: str) -> pd.DataFrame:
             casos.append(_criar_caso(" | ".join(ids), titulo_gr, dept_caso, titulo_gr, resumo))
             continue
 
+        # Fallthrough: linha não reconhecida — salvar como possível título para o próximo Pasta:/Pastas:
+        titulo_pendente = l
         i += 1
 
     return pd.DataFrame(casos) if casos else pd.DataFrame()
@@ -824,182 +889,42 @@ st.markdown("<br>", unsafe_allow_html=True)
 # ── ABAS DE ENTRADA ───────────────────────────────────────────
 st.markdown('<div class="sec-label">Dados dos Processos</div>', unsafe_allow_html=True)
 
-aba_texto, aba_pdf = st.tabs([
-    "✍️  Colar Texto",
-    "📄  Upload PDF",
-])
-
 df_total = None
 fonte = None
 
-# ── ABA 1: TEXTO LIVRE ────────────────────────────────────────
-with aba_texto:
-    st.markdown("""
-    <p style="color:#333;font-size:13px;margin-bottom:10px;">
-    Cole abaixo o texto gerado pelo <strong>Gem do Google</strong> (ou qualquer IA) — o app lê automaticamente.<br>
-    Também aceita entrada manual simples começando com <strong>Pasta:</strong>. Não precisa de separadores.
-    </p>
-    """, unsafe_allow_html=True)
+# ── ENTRADA DE TEXTO ──────────────────────────────────────────
+st.markdown("""
+<p style="color:#333;font-size:13px;margin-bottom:10px;">
+Cole abaixo o texto gerado pelo <strong>Gem do Google</strong> (ou qualquer IA) — o app lê automaticamente.<br>
+Também aceita entrada manual simples começando com <strong>Pasta:</strong>. Não precisa de separadores.
+</p>
+""", unsafe_allow_html=True)
 
-    texto_colado = st.text_area(
-        "Dados dos processos",
-        height=360,
-        placeholder=(
-            "Cole aqui o texto gerado pelo Gem do Google ou outra IA.\n\n"
-            "Formato aceito:\n\n"
-            "### BCA / Área Operacional / Contencioso Cível\n\n"
-            "**Pastas: Proc-0001717 e Proc-0001719 (Ações Reais)**\n"
-            "O caso se refere a uma ação demarcatória... Deliberação:\n\n"
-            "### BCA / Área Operacional / Trabalhista\n\n"
-            "**Pastas: Proc-0002217 e Proc-0003349 (Processos Suspensos)**\n"
-            "O caso se refere a reclamações trabalhistas... Deliberação:"
-        ),
-        label_visibility="collapsed",
-    )
+texto_colado = st.text_area(
+    "Dados dos processos",
+    height=360,
+    placeholder=(
+        "Cole aqui o texto gerado pelo Gem do Google ou outra IA.\n\n"
+        "Formato aceito:\n\n"
+        "### BCA / Área Operacional / Contencioso Cível\n\n"
+        "**Pastas: Proc-0001717 e Proc-0001719 (Ações Reais)**\n"
+        "O caso se refere a uma ação demarcatória... Deliberação:\n\n"
+        "### BCA / Área Operacional / Trabalhista\n\n"
+        "**Pastas: Proc-0002217 e Proc-0003349 (Processos Suspensos)**\n"
+        "O caso se refere a reclamações trabalhistas... Deliberação:"
+    ),
+    label_visibility="collapsed",
+)
 
-    if texto_colado.strip():
-        df_texto = parsear_texto_livre(texto_colado)
-        if not df_texto.empty:
-            fonte = "texto"
-            df_total = df_texto
-            total_pastas = sum(len(r["id_caso"].split(" | ")) for _, r in df_texto.iterrows())
-            st.success(f"✅ {len(df_texto)} grupo(s) · {total_pastas} pasta(s) reconhecida(s)")
-        else:
-            st.warning("⚠️ Não foi possível reconhecer processos. Verifique o formato.")
-
-# ── ABA 2: PDF ────────────────────────────────────────────────
-with aba_pdf:
-    st.markdown("""
-    <p style="color:#333;font-size:13px;margin-bottom:8px;">
-    Faça upload do PDF exportado do <strong>Novajus</strong> — relatório de Andamentos de Casos.
-    </p>
-    """, unsafe_allow_html=True)
-
-    arquivo_pdf = st.file_uploader(
-        "PDF exportado do Novajus",
-        type=["pdf"],
-        key="uploader_pdf",
-        label_visibility="collapsed",
-    )
-
-    if arquivo_pdf:
-        try:
-            import pdfplumber
-
-            def parsear_pdf(uploaded_file):
-                CAMPOS = {
-                    "Número CNJ": "cnj", "Ação": "acao", "Natureza": "natureza",
-                    "Data da distribuição": "data_distribuicao", "Valor da causa": "valor",
-                    "Status": "status", "Escritório responsável": "escritorio",
-                    "Cliente principal": "cliente", "Contrário principal": "contrario",
-                    "Órgão": "orgao",
-                }
-
-                def cells(row):
-                    """Retorna lista de strings limpas de uma linha de tabela."""
-                    return [(c or "").strip() for c in (row or [])]
-
-                casos_pdf = []
-                caso_pdf = None
-
-                def salvar_pdf():
-                    if not caso_pdf or not caso_pdf.get("acao"):
-                        return
-                    ands = caso_pdf.get("_ands", [])
-                    historico = "\n".join(f"[{a['data']}] {a['desc']}" for a in ands)
-                    ultimo = ands[0]["desc"] if ands else ""
-                    esc = caso_pdf.get("escritorio", "").lower()
-                    dept = (
-                        "Trabalhista" if "trabalhist" in esc else
-                        "Público"     if any(k in esc for k in ("público", "publico")) else
-                        "Cível"       if any(k in esc for k in ("cível", "civil", "conflitos")) else
-                        "Privado"     if "privado" in esc else
-                        "Compliance"  if "compliance" in esc else
-                        inferir_dept(caso_pdf.get("acao", ""))
-                    )
-                    cliente = caso_pdf.get("cliente", "").replace("(filial cliente principal)", "").strip()
-                    contrario = caso_pdf.get("contrario", "")
-                    casos_pdf.append({
-                        "id_caso": caso_pdf["_pasta"],
-                        "titulo": f"{caso_pdf.get('acao','')} — {cliente[:40]} x {contrario[:40]}",
-                        "dept": dept, "acao": caso_pdf.get("acao", ""),
-                        "partes": f"{cliente} x {contrario}",
-                        "orgao": caso_pdf.get("orgao", ""), "valor": caso_pdf.get("valor", ""),
-                        "historico": historico, "ultimo": ultimo, "n_and": len(ands),
-                        "data_distribuicao": caso_pdf.get("data_distribuicao", ""),
-                        "resumo_manual": "",
-                    })
-
-                _PAT_PASTA = re.compile(r'^(?:Proc|Doc|Serv)-\d+', re.IGNORECASE)
-                _PAT_DATA  = re.compile(r'^\d{2}/\d{2}/\d{4}$')
-
-                with pdfplumber.open(uploaded_file) as pdf:
-                    for page in pdf.pages:
-                        for tab in (page.extract_tables() or []):
-                            for row in tab:
-                                cs = cells(row)
-                                if not any(cs):
-                                    continue
-
-                                # ── Detectar linha de nova Pasta (busca flexível por posição) ──
-                                pasta_id = None
-                                has_pasta_label = any(c.lower() == "pasta" for c in cs)
-                                if has_pasta_label:
-                                    for c in cs:
-                                        if _PAT_PASTA.match(c):
-                                            pasta_id = c.replace(" ", "")
-                                            break
-                                if pasta_id:
-                                    salvar_pdf()
-                                    caso_pdf = {"_pasta": pasta_id, "_ands": []}
-                                    continue
-
-                                if caso_pdf is None:
-                                    continue
-
-                                # ── Detectar campo de metadado (rótulo → valor) ──
-                                campo_encontrado = False
-                                for j, c in enumerate(cs):
-                                    if c in CAMPOS:
-                                        # Valor: primeiro conteúdo não-vazio após o rótulo
-                                        for k in range(j + 1, len(cs)):
-                                            if cs[k]:
-                                                caso_pdf[CAMPOS[c]] = cs[k]
-                                                break
-                                        campo_encontrado = True
-                                        break
-                                if campo_encontrado:
-                                    continue
-
-                                # ── Detectar linha de Andamento (data em qualquer posição) ──
-                                for j, c in enumerate(cs):
-                                    if _PAT_DATA.match(c):
-                                        # Aceita a linha se contém "andamento" ou se há descrição
-                                        tem_andamento = any("andamento" in (cs[k] or "").lower() for k in range(len(cs)))
-                                        desc_parts = [
-                                            cs[k] for k in range(j + 1, len(cs))
-                                            if cs[k] and not _PAT_DATA.match(cs[k])
-                                            and cs[k].lower() not in ("andamento", "")
-                                        ]
-                                        desc = " ".join(desc_parts).strip()
-                                        if desc and (tem_andamento or len(desc) > 10):
-                                            caso_pdf["_ands"].append({"data": c, "desc": " ".join(desc.split())})
-                                        break
-
-                salvar_pdf()
-                return pd.DataFrame(casos_pdf)
-
-            df_pdf = parsear_pdf(arquivo_pdf)
-            if not df_pdf.empty:
-                fonte = "pdf"
-                df_total = df_pdf
-                st.success(f"✅ {len(df_pdf)} processo(s) lido(s) do PDF")
-            else:
-                st.warning("⚠️ Nenhum processo encontrado no PDF.")
-        except ImportError:
-            st.error("❌ Instale pdfplumber: `pip install pdfplumber`")
-        except Exception as e:
-            st.error(f"❌ Erro ao ler PDF: {e}")
+if texto_colado.strip():
+    df_texto = parsear_texto_livre(texto_colado)
+    if not df_texto.empty:
+        fonte = "texto"
+        df_total = df_texto
+        total_pastas = sum(len(r["id_caso"].split(" | ")) for _, r in df_texto.iterrows())
+        st.success(f"✅ {len(df_texto)} grupo(s) · {total_pastas} pasta(s) reconhecida(s)")
+    else:
+        st.warning("⚠️ Não foi possível reconhecer processos. Verifique o formato.")
 
 
 st.markdown("<br>", unsafe_allow_html=True)
@@ -1031,7 +956,7 @@ gerar = st.button(
     disabled=not pode_gerar,
 )
 if not pode_gerar:
-    st.caption("Cole os dados ou faça upload de um arquivo para continuar.")
+    st.caption("Cole os dados dos processos para continuar.")
 
 # ── GERAÇÃO ───────────────────────────────────────────────────
 if gerar and pode_gerar:
